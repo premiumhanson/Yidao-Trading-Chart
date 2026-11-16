@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Yidao Trading Chart</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script type="module" src="/app.mjs"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="brand-icon" aria-hidden="true">▥</span>Yidao Trading Chart</div>
+    <button id="symbol-button" class="symbol-button" title="搜索品种（/）" aria-label="搜索品种">
+      <span id="active-symbol">—</span><span class="quiet">⌕</span>
+    </button>
+    <nav id="intervals" class="intervals" aria-label="K 线周期"></nav>
+    <div class="top-actions">
+      <div class="indicator-controls" role="group" aria-label="图表指标">
+        <button id="indicator-reversal" aria-pressed="true">顶底识别</button>
+        <button id="indicator-pivots" aria-pressed="true">枢纽点</button>
+        <button id="indicator-magnet" aria-pressed="true">磁力线</button>
+      </div>
+      <button id="grid-toggle" aria-pressed="true" title="切换四图联动与单图">▦ <span>联动</span></button>
+      <button id="replay-toggle" aria-pressed="false">▷ <span>回放</span></button>
+      <label class="source-picker"><span class="source-dot"></span>
+        <select id="source" aria-label="行情来源">
+          <option value="offline">本地历史库</option>
+          <option value="ctrader">cTrader</option>
+        </select>
+      </label>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <aside class="tool-rail" aria-label="图表工具">
+      <button id="cursor-tool" aria-pressed="true" title="十字光标（Esc）" aria-label="十字光标">✛</button>
+      <button id="trend-tool" aria-pressed="false" title="趋势线" aria-label="趋势线">╱</button>
+      <button id="level-tool" aria-pressed="false" title="水平线" aria-label="水平线">━</button>
+      <button id="undo-tool" title="撤销最近一笔" aria-label="撤销最近一笔">↶</button>
+      <div class="rail-divider"></div>
+      <button id="sma-tool" aria-pressed="false" title="20 周期均线" aria-label="20 周期均线">ƒ</button>
+      <button id="fit-tool" title="显示全部已加载 K 线" aria-label="适配图表">⤢</button>
+    </aside>
+
+    <section class="center" aria-label="K 线工作区">
+      <div class="instrument">
+        <div>
+          <h1 id="instrument-name">正在载入行情</h1><p id="instrument-meta"></p>
+        </div>
+        <div class="instrument-quote">
+          <strong id="last-close">—</strong><span id="last-change"></span>
+        </div>
+        <div id="live-quote" class="live-quote" hidden>
+          <span>Bid <strong id="live-bid">—</strong></span>
+          <span>Ask <strong id="live-ask">—</strong></span>
+        </div>
+        <span id="chart-notice" class="chart-notice" role="status"></span>
+      </div>
+      <div id="workspace-error" class="workspace-error" role="alert" hidden>
+        <strong id="error-message"></strong>
+        <button id="retry-button">重试</button>
+        <button id="offline-button">返回本地历史库</button>
+      </div>
+      <div id="charts" class="charts" aria-label="价格图"></div>
+      <section id="replay-panel" class="replay" aria-label="历史回放" hidden>
+        <div class="replay-line">
+          <span class="replay-label">H1 回放</span>
+          <label class="date-label"><span class="sr-only">回放开始日期</span><input id="replay-date" type="date"></label>
+          <button id="replay-start">跳转</button>
+          <button id="replay-random">随机起点</button>
+          <div class="play-controls">
+            <button id="replay-prev" aria-label="上一根 H1" title="上一根 H1">‹</button>
+            <button id="replay-play" aria-label="播放" title="播放">▶</button>
+            <button id="replay-next" aria-label="下一根 H1" title="下一根 H1">›</button>
+          </div>
+          <select id="replay-speed" aria-label="播放速度">
+            <option value="1100">1×</option><option value="600">2×</option><option value="300">4×</option>
+          </select>
+          <time id="replay-cursor"></time>
+        </div>
+        <div class="replay-line practice">
+          <span class="replay-label">模拟复盘</span>
+          <button id="paper-win" class="up">胜 +3R</button>
+          <button id="paper-loss" class="down">负 −1R</button>
+          <button id="paper-undo">撤销</button>
+          <span id="paper-status">累计 0R</span>
+          <button id="paper-log">记录 <span id="paper-count">0</span></button>
+        </div>
+      </section>
+      <footer class="statusbar">
+        <span id="connection-status" role="status">连接本机服务…</span>
+        <span><a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">图表由 TradingView Lightweight Charts™ 提供</a> <span class="status-divider">·</span> UTC+8</span>
+      </footer>
+    </section>
+
+    <aside class="watchlist" aria-label="品种列表">
+      <div class="watch-heading"><h2>品种列表</h2><span id="symbol-count"></span></div>
+      <label class="search-box"><span aria-hidden="true">⌕</span><input id="symbol-search" type="search" placeholder="搜索品种或名称" aria-label="搜索品种或名称"></label>
+      <div class="watch-tabs" role="group" aria-label="筛选品种">
+        <button id="all-symbols" aria-pressed="true">全部</button>
+        <button id="favorite-symbols" aria-pressed="false">收藏</button>
+      </div>
+      <div class="watch-columns" aria-hidden="true"><span>品种</span><span id="watch-quote-label">收盘 / H1 涨跌</span></div>
+      <div id="symbols" class="symbol-list"></div>
+      <div id="watch-note" class="watch-note"></div>
+    </aside>
+  </main>
+
+  <dialog id="paper-dialog" class="paper-dialog">
+    <div class="dialog-heading"><h2>模拟复盘记录</h2><form method="dialog"><button aria-label="关闭">×</button></form></div>
+    <p id="paper-summary"></p>
+    <div class="paper-table"><table>
+      <thead><tr><th>品种</th><th>回放时间</th><th>结果</th></tr></thead>
+      <tbody id="paper-rows"></tbody>
+    </table></div>
+  </dialog>
+</body>
+</html>
