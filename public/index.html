@@ -20,12 +20,14 @@
         <button id="indicator-pivots" aria-pressed="true">枢纽点</button>
         <button id="indicator-magnet" aria-pressed="true">磁力线</button>
       </div>
+      <button id="alerts-button" aria-haspopup="dialog">警报 <span id="alerts-new" aria-label="有新警报" hidden></span></button>
       <button id="grid-toggle" aria-pressed="true" title="切换四图联动与单图">▦ <span>联动</span></button>
       <button id="replay-toggle" aria-pressed="false">▷ <span>回放</span></button>
       <label class="source-picker"><span class="source-dot"></span>
         <select id="source" aria-label="行情来源">
           <option value="offline">本地历史库</option>
-          <option value="ctrader">cTrader</option>
+          <option value="ctrader-local" selected>cTrader 本地</option>
+          <option value="ctrader">cTrader Open API</option>
         </select>
       </label>
     </div>
@@ -53,6 +55,7 @@
         <div id="live-quote" class="live-quote" hidden>
           <span>Bid <strong id="live-bid">—</strong></span>
           <span>Ask <strong id="live-ask">—</strong></span>
+          <small id="live-time" aria-label="最新报价时间"></small>
         </div>
         <span id="chart-notice" class="chart-notice" role="status"></span>
       </div>
@@ -102,6 +105,10 @@
       </div>
       <div class="watch-columns" aria-hidden="true"><span>品种</span><span id="watch-quote-label">收盘 / H1 涨跌</span></div>
       <div id="symbols" class="symbol-list"></div>
+      <div id="archive-strip" class="archive-strip" hidden>
+        <span id="archive-note" role="status"></span>
+        <button id="archive-sync">补历史</button>
+      </div>
       <div id="watch-note" class="watch-note"></div>
     </aside>
   </main>
@@ -114,5 +121,26 @@
       <tbody id="paper-rows"></tbody>
     </table></div>
   </dialog>
+  <dialog id="alerts-dialog" class="alerts-dialog" aria-labelledby="alerts-heading">
+    <div class="dialog-heading">
+      <h2 id="alerts-heading">本机警报</h2>
+      <form method="dialog"><button aria-label="关闭警报">×</button></form>
+    </div>
+    <div class="alerts-controls">
+      <button id="alerts-watch-current" disabled>监测当前品种</button>
+      <span id="alerts-connection" role="status"></span>
+    </div>
+    <div id="alerts-watches" class="alerts-watches" aria-label="监测品种"></div>
+    <div class="alerts-controls alerts-history-heading">
+      <label class="alert-search"><input id="alerts-search" type="search" placeholder="搜索品种" aria-label="搜索警报品种"></label>
+      <button id="alerts-grouped" aria-pressed="true" title="切换品种卡片与逐条记录">按品种合并</button>
+      <span class="quiet">收盘时间 · UTC+8</span>
+    </div>
+    <div id="alerts-list" class="alerts-list"></div>
+    <div class="alerts-footer">
+      <small id="alerts-status" role="status"></small><button id="alerts-more" hidden>更早记录</button>
+    </div>
+  </dialog>
+  <div id="alert-toast" class="alert-toast" role="status" hidden></div>
 </body>
 </html>

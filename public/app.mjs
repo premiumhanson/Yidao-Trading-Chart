@@ -1,5 +1,9 @@
-import { CandlestickSeries, CrosshairMode, LineSeries, PriceScaleMode, createChart, createSeriesMarkers } from '/charts.mjs';
-import { calculateIndicators } from '/indicators.mjs';
+import { CandlestickSeries, CrosshairMode, LineSeries, PriceScaleMode, createChart } from '/charts.mjs';
+import { calculateIndicators, indicatorContexts } from '/indicators.mjs';
+import { barEnd, hour, rollBars } from '/indicator-time.mjs';
+import { topBottomIndicator, topBottomPeriods } from '/top-bottom.mjs';
+import { attachTopBottomView } from '/top-bottom-view.mjs';
+import { installAlerts } from '/alerts-view.mjs';
 
 const $ = id => document.getElementById(id);
 const elements = {
@@ -13,14 +17,21 @@ const periods = {
 };
 const commonPeriods = ['1h', '4h', '1d', '1w', '1mo'];
 const categoryNames = { MAJOR: '主要货币对', CROSS: '交叉货币对', EXOTIC: '其他货币对', METAL: '贵金属', INDEX: '指数', ENERGY: '能源' };
+const categoryOrder = ['MAJOR', 'METAL', 'INDEX', 'ENERGY', 'CROSS', 'EXOTIC', 'BROKER'];
+const ohlcKeys = [['O', 'open'], ['H', 'high'], ['L', 'low'], ['C', 'close']];
+const defaultSource = 'ctrader-local';
 const localDate = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', dateStyle: 'short' });
 const localTime = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', dateStyle: 'short', timeStyle: 'short' });
+const quoteTime = new Intl.DateTimeFormat('sv-SE', { timeZone: 'Asia/Shanghai', timeStyle: 'medium' });
 const state = {
-  source: 'offline', sourceInfo: {}, catalog: [], symbol: null, favoritesOnly: false,
+  source: defaultSource, sourceInfo: {}, catalog: [], symbol: null, favoritesOnly: false,
   activePane: 'main', split: true, replay: null, playing: false, stepping: false,
   drawingTool: 'cursor', drawingStart: null, sma: false, revision: 0, sourceRevision: 0,
-  busy: false, syncing: false, liveStream: null, streamKey: null, liveBars: new Map(),
+  busy: false, crosshair: null, liveStream: null, streamKey: null,
+  liveBars: new Map(), previews: new Map(), contextSources: {}, archiveJob: null,
+  pendingSymbol: null, chartCache: new Map(),
 };
+const liveSource = () => state.source !== 'offline';
 
 function readStorage(key, fallback) {
   try { return JSON.parse(localStorage.getItem(key)) ?? fallback; }
@@ -41,6 +52,9 @@ function element(tag, className, content) {
   if (content !== undefined) node.textContent = content;
   return node;
 }
+function writeText(node, text) {
+  if (node.textContent !== text) node.textContent = text;
+}
 function displayTime(time) { return localTime.format(new Date(time * 1000)); }
 function displayDate(time) { return localDate.format(new Date(time * 1000)); }
 function price(value, digits) { return Number.isFinite(value) ? value.toFixed(digits ?? 5) : '—'; }
@@ -51,12 +65,12 @@ function displayError(message = '') {
   $('error-message').textContent = message;
   $('offline-button').hidden = state.source === 'offline';
 }
-async function api(path, parameters = {}, source = state.source) {
+async function api(path, parameters = {}, source = state.source, signal) {
   const query = new URLSearchParams({ source });
   for (const [key, value] of Object.entries(parameters)) {
     if (value !== undefined && value !== null) query.set(key, value);
   }
-  const response = await fetch(`/api/${path}?${query}`);
+  const response = await fetch(`/api/${path}?${query}`, { signal });
   const data = await response.json();
   if (!response.ok) throw new Error(data.error || '无法读取行情。');
   return data;
@@ -70,17 +84,28 @@ function chartPane(id, interval, name) {
   const select = element('select');
   select.setAttribute('aria-label', `${name}周期`);
   const ohlc = element('span', 'pane-ohlc');
+  const ohlcValues = ohlcKeys.map(([label]) => {
+    const field = element('span', '', label + ' ');
+    const value = element('b', '', '—');
+    field.append(value);
+    ohlc.append(field);
+    return value;
+  });
+  const magneticStatus = element('span', 'magnet-status');
+  magneticStatus.hidden = true;
   const expand = element('button', '', '⤢');
   expand.title = '切换单图';
   expand.setAttribute('aria-label', `展开${name}`);
+  const latest = element('button', 'pane-latest', '回到最新');
+  latest.hidden = true;
   const widget = element('div', 'chart-widget');
   const placeholder = element('div', 'chart-placeholder');
   const reason = element('span');
-  const changeFeed = element('button', '', '切换到 cTrader');
-  changeFeed.addEventListener('click', () => changeSource('ctrader'));
+  const changeFeed = element('button', '', '切换到 cTrader 本地');
+  changeFeed.addEventListener('click', () => changeSource('ctrader-local'));
   placeholder.append(reason, changeFeed);
   placeholder.hidden = true;
-  top.append(select, ohlc, expand);
+  top.append(select, ohlc, magneticStatus, latest, expand);
   root.append(top, widget);
   elements.charts.append(root);
   const chart = createChart(widget, {
@@ -97,7 +122,7 @@ function chartPane(id, interval, name) {
       scaleMargins: { top: 0.11, bottom: 0.10 },
     },
     timeScale: {
-      borderColor: '#243329', timeVisible: true, secondsVisible: false, rightOffset: 5,
+      borderColor: '#243329', timeVisible: true, secondsVisible: false, rightBarStaysOnScroll: true,
       minBarSpacing: 1, tickMarkFormatter: (time, type) => {
         const date = displayDate(time);
         if (type === 0) return date.slice(0, 4);
@@ -116,23 +141,27 @@ function chartPane(id, interval, name) {
   const series = chart.addSeries(CandlestickSeries, {
     upColor: '#47d779', downColor: '#f36870', borderVisible: false,
     wickUpColor: '#4ad37b', wickDownColor: '#ed646d',
+    autoscaleInfoProvider: stableLiveScale,
   });
   const sma = chart.addSeries(LineSeries, {
     color: '#dfbc65', lineWidth: 1, lastValueVisible: false, priceLineVisible: false,
     crosshairMarkerVisible: false, visible: false,
   });
-  const magnet = chart.addSeries(LineSeries, {
-    color: '#b39ddb', lineWidth: 3, lastValueVisible: false, priceLineVisible: false,
-    crosshairMarkerVisible: false, autoscaleInfoProvider: () => null,
-  });
-  const markers = createSeriesMarkers(series, [], { autoScale: false });
+  const magnetOptions = { lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false, autoscaleInfoProvider: () => null };
+  const magnetGlow = chart.addSeries(LineSeries, { ...magnetOptions, lineWidth: 4 });
+  const magnet = chart.addSeries(LineSeries, { ...magnetOptions, color: '#b39ddb', lineWidth: 2 });
+  const magnetUpper = chart.addSeries(LineSeries, { ...magnetOptions, lineWidth: 1 });
+  const magnetLower = chart.addSeries(LineSeries, { ...magnetOptions, lineWidth: 1 });
   const pane = {
-    id, root, select, ohlc, chart, series, sma, magnet, markers, interval, bars: [], digits: 5,
+    id, root, select, ohlc, ohlcValues, chart, series, sma, magnet, magnetGlow, magnetUpper, magnetLower,
+    magneticStatus, interval, bars: [], digits: 5,
     widget, overlays: [], hasMore: false, paging: false, dataKey: null,
     placeholder, reason, changeFeed,
   };
   widget.append(placeholder);
+  pane.latestView = attachLatestViewport(pane, latest);
   pane.indicatorOverlay = attachIndicatorOverlay(pane);
+  pane.topBottomView = attachTopBottomView(pane);
   pane.ohlc.addEventListener('click', () => setActive(pane));
   select.addEventListener('change', () => changeInterval(pane, select.value));
   expand.addEventListener('click', () => {
@@ -143,15 +172,87 @@ function chartPane(id, interval, name) {
   });
   chart.subscribeClick(param => chartClick(pane, param));
   chart.subscribeCrosshairMove(param => syncCrosshair(pane, param));
+  for (const type of ['pointerleave', 'pointercancel']) {
+    widget.addEventListener(type, () => {
+      if (state.crosshair?.pane === pane) clearCrosshair();
+    });
+  }
   chart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    if (state.crosshair && state.crosshair.pane !== pane) renderCrosshair(pane);
     if (range && range.from < 16 && range.to < pane.bars.length - 10) pageHistory(pane);
   });
   return pane;
 }
 
+function attachLatestViewport(pane, button) {
+  const scale = pane.chart.timeScale();
+  let following = true;
+  let drag;
+  let scheduled = false;
+
+  function keepOffset() {
+    if (!following || scheduled || !pane.bars.length) return;
+    scheduled = true;
+    requestAnimationFrame(() => {
+      scheduled = false;
+      if (!following || scale.width() <= 0 || !pane.bars.length) return;
+      const spacing = scale.options().barSpacing;
+      const target = Math.ceil(pane.widget.clientWidth / 6) / spacing;
+      if (Math.abs(scale.scrollPosition() - target) * spacing > 0.25) scale.scrollToPosition(target, false);
+    });
+  }
+
+  function align(initial = false) {
+    const width = scale.width();
+    if (!following || width <= 0 || !pane.bars.length) return;
+    const rightOffsetPixels = Math.ceil(pane.widget.clientWidth / 6);
+    const options = {};
+    if (rightOffsetPixels !== scale.options().rightOffsetPixels) options.rightOffsetPixels = rightOffsetPixels;
+    if (initial) {
+      const count = Math.min(pane.bars.length, pane.id === 'main' ? 165 : 105);
+      options.barSpacing = Math.max(1, (width - rightOffsetPixels) / count);
+    }
+    if (Object.keys(options).length) scale.applyOptions(options);
+    keepOffset();
+  }
+
+  function follow(enabled) {
+    following = enabled;
+    button.hidden = enabled || !pane.bars.length;
+  }
+
+  button.addEventListener('click', () => {
+    follow(true);
+    align();
+  });
+  pane.widget.addEventListener('pointerdown', event => {
+    drag = event.isPrimary && event.button === 0 ? { id: event.pointerId, x: event.clientX } : undefined;
+  }, { passive: true });
+  pane.widget.addEventListener('pointermove', event => {
+    if (drag?.id !== event.pointerId || (event.pointerType !== 'touch' && !(event.buttons & 1))) return;
+    if (Math.abs(event.clientX - drag.x) > 8) {
+      follow(false);
+      drag = undefined;
+    }
+  }, { passive: true });
+  for (const type of ['pointerup', 'pointercancel']) {
+    pane.widget.addEventListener(type, () => { drag = undefined; }, { passive: true });
+  }
+  pane.widget.addEventListener('wheel', event => {
+    if (Math.abs(event.deltaX) > Math.abs(event.deltaY)) follow(false);
+  }, { passive: true });
+  scale.subscribeSizeChange(() => align());
+  scale.subscribeVisibleLogicalRangeChange(keepOffset);
+  return {
+    align,
+    reset() { follow(true); align(true); },
+    fit() { follow(true); align(); scale.fitContent(); },
+  };
+}
+
 const panes = [
-  chartPane('upper', '4h', '左上图'), chartPane('intraday', '15m', '右上图'),
-  chartPane('lower', '1h', '左下图'), chartPane('main', '1w', '右下图'),
+  chartPane('upper', '1h', '左上图'), chartPane('intraday', '15m', '右上图'),
+  chartPane('lower', '4h', '左下图'), chartPane('main', '1w', '右下图'),
 ];
 const activePane = () => panes.find(pane => pane.id === state.activePane);
 const visiblePanes = () => state.split ? panes : [activePane()];
@@ -167,6 +268,7 @@ function updateLayout() {
     pane.root.hidden = !state.split && pane !== activePane();
     pane.root.classList.toggle('active', pane === activePane());
   }
+  if (state.crosshair?.pane.root.hidden) clearCrosshair();
 }
 function renderPeriods() {
   elements.periods.replaceChildren();
@@ -197,6 +299,7 @@ function setActive(pane) {
   renderPeriods();
 }
 function changeInterval(pane, interval) {
+  clearCrosshair();
   setActive(pane);
   pane.interval = interval;
   pane.dataKey = null;
@@ -204,17 +307,32 @@ function changeInterval(pane, interval) {
   refreshCharts();
 }
 
-function renderOHLC(pane, bar = pane.bars.at(-1)) {
-  pane.ohlc.replaceChildren();
-  if (!bar) {
-    pane.ohlc.textContent = '暂无 K 线';
-    return;
+function renderOHLC(pane, bar = pane.appliedPreview || pane.bars.at(-1)) {
+  for (const [index, [, key]] of ohlcKeys.entries()) {
+    writeText(pane.ohlcValues[index], price(bar?.[key], pane.digits));
   }
-  for (const [label, key] of [['O', 'open'], ['H', 'high'], ['L', 'low'], ['C', 'close']]) {
-    const text = element('span', '', `${label} `);
-    text.append(element('b', '', price(bar[key], pane.digits)));
-    pane.ohlc.append(text);
-  }
+  const status = bar?.time === pane.appliedPreview?.time ? ' · 未收盘' : '';
+  const title = bar?.time ? `${displayTime(bar.time)} UTC+8${status}` : '';
+  if (pane.ohlc.title !== title) pane.ohlc.title = title;
+}
+function stableLiveScale(original) {
+  const result = original();
+  const range = result?.priceRange;
+  if (state.source !== 'ctrader-local' || !range) return result;
+  const span = range.maxValue - range.minValue;
+  if (!(span > 0)) return result;
+  const step = 10 ** Math.floor(Math.log10(span * 0.04));
+  return { ...result, priceRange: {
+    minValue: Math.floor(range.minValue / step) * step,
+    maxValue: Math.ceil(range.maxValue / step) * step,
+  } };
+}
+function sameCandle(a, b) {
+  return a === b || Boolean(a && b && a.time === b.time && a.open === b.open &&
+    a.high === b.high && a.low === b.low && a.close === b.close);
+}
+function sameCandles(a, b) {
+  return a === b || (a?.length === b.length && b.every((bar, i) => sameCandle(a[i], bar)));
 }
 function movingAverage(bars) {
   let sum = 0;
@@ -248,22 +366,17 @@ function attachIndicatorOverlay(pane) {
           const left = Math.max(0, x0);
           const right = Math.min(width, x1);
           const color = annotation.color || '#ddca99';
-          if (annotation.price === undefined) {
-            const top = pane.series.priceToCoordinate(annotation.high);
-            const bottom = pane.series.priceToCoordinate(annotation.low);
-            if (top === null || bottom === null || bottom < 0 || top > height) continue;
-            context.globalAlpha = 0.15;
-            context.fillStyle = color;
-            context.fillRect(left, top, Math.max(2, right - left), bottom - top);
-            context.globalAlpha = 0.55;
+          if (annotation.fromPrice !== undefined) {
+            const start = pane.series.priceToCoordinate(annotation.fromPrice);
+            const end = pane.series.priceToCoordinate(annotation.toPrice);
+            if (start === null || end === null) continue;
+            context.globalAlpha = 0.57;
             context.strokeStyle = color;
-            context.setLineDash([4, 3]);
-            context.strokeRect(left, top, Math.max(2, right - left), bottom - top);
-            context.setLineDash([]);
-            if (right - left > 36) {
-              context.fillStyle = color;
-              context.fillText(annotation.label || '', left + 4, top + 13);
-            }
+            context.lineWidth = 1.4;
+            context.beginPath();
+            context.moveTo(x0, start);
+            context.lineTo(x1, end);
+            context.stroke();
           } else {
             const y = pane.series.priceToCoordinate(annotation.price);
             if (y === null || y < 0 || y > height) continue;
@@ -296,119 +409,271 @@ function attachIndicatorOverlay(pane) {
   return annotations => { data = annotations; update?.(); };
 }
 function renderIndicators(pane) {
-  const result = calculateIndicators(pane.bars, {
+  const options = {
     interval: pane.interval, higherBars: state.contextBars, digits: pane.digits,
-    showReversals: indicatorToggles.reversal, showPivots: indicatorToggles.pivots,
-    showMagnet: indicatorToggles.magnet,
+    cutoff: state.replay === null ? undefined : state.replay + hour,
+  };
+  const result = calculateIndicators(pane.bars, {
+    ...options, showPivots: indicatorToggles.pivots, showMagnet: indicatorToggles.magnet,
   });
+  const cutoff = options.cutoff ?? (state.source === 'offline' && Number.isFinite(state.latestObserved)
+    ? state.latestObserved + hour : undefined);
+  pane.topBottom = indicatorToggles.reversal ? topBottomIndicator(pane.bars, { ...options, cutoff }) : undefined;
+  pane.topBottomView.set(pane.topBottom);
   pane.magnet.setData(result.magnet);
-  pane.markers.setMarkers(result.reversals);
-  pane.indicatorOverlay([...result.zones, ...result.pivots]);
+  pane.magnetGlow.setData(result.glow);
+  pane.magnetUpper.setData(result.upper);
+  pane.magnetLower.setData(result.lower);
+  pane.indicatorOverlay(result.pivots);
+  pane.magneticStatus.hidden = !result.latest;
+  if (result.latest) {
+    const { score, price: magneticPrice, strength, slope, resonance } = result.latest;
+    pane.magneticStatus.textContent = `磁力 ${score > 0 ? '+' : ''}${score}${resonance ? ' · 共振' + resonance : ''}`;
+    pane.magneticStatus.title = `磁力价 ${price(magneticPrice, pane.digits)} · 斜率 ${slope.toFixed(3)}% ${strength}`;
+  }
 }
 function applyBars(pane, data, { reset = false } = {}) {
-  pane.bars = data.bars;
-  pane.digits = data.digits ?? 5;
+  const digits = data.digits ?? 5;
   pane.hasMore = data.hasMore;
-  pane.series.applyOptions({ priceFormat: { type: 'price', precision: pane.digits, minMove: 10 ** -pane.digits } });
-  pane.series.setData(pane.bars);
-  displayMovingAverage(pane);
-  renderOHLC(pane);
-  renderDrawings(pane);
-  if (reset && pane.bars.length) {
-    const last = pane.bars.length - 1;
-    pane.chart.timeScale().setVisibleLogicalRange({ from: Math.max(-1, last - (pane.id === 'main' ? 165 : 105)), to: last + 6 });
+  if (!reset && digits === pane.digits && sameCandles(pane.bars, data.bars)) return false;
+  if (digits !== pane.digits || reset) {
+    pane.digits = digits;
+    pane.series.applyOptions({ priceFormat: { type: 'price', precision: digits, minMove: 10 ** -digits } });
   }
+  pane.bars = data.bars;
+  pane.series.setData(pane.bars);
+  pane.appliedPreview = undefined;
+  displayPreview(pane);
+  displayMovingAverage(pane);
+  renderDrawings(pane);
+  if (reset) pane.latestView.reset();
+  else pane.latestView.align();
+  renderCrosshair(pane);
+  return true;
 }
 function renderInstrument(bars, digits) {
   const last = bars.at(-1);
   const prev = bars.at(-2);
   const change = last && prev?.close ? (last.close / prev.close - 1) * 100 : null;
-  $('last-close').textContent = price(last?.close, digits);
-  $('last-change').textContent = change === null ? '' : percent(change);
+  writeText($('last-close'), price(last?.close, digits));
+  writeText($('last-change'), change === null ? '' : percent(change));
   $('last-change').className = change === null ? '' : change >= 0 ? 'up' : 'down';
 }
 function clearChartData() {
   state.revision++;
+  state.refreshController?.abort();
+  state.refreshController = undefined;
+  state.pendingSymbol = null;
   state.busy = false;
+  clearCrosshair();
+  state.contextSources = {};
   state.contextBars = {};
+  state.latestObserved = undefined;
   for (const pane of panes) {
     pane.dataKey = null;
-    applyBars(pane, { bars: [], digits: 5, hasMore: false });
+    applyBars(pane, { bars: [], digits: 5, hasMore: false }, { reset: true });
     renderIndicators(pane);
   }
   renderInstrument([], 5);
 }
 function candleKey(pane) { return `${state.source}:${state.symbol?.id}:${pane.interval}`; }
-function barParameters(pane, before = state.replay === null ? undefined : state.replay + 1) {
-  return { symbol: state.symbol.id, interval: pane.interval, limit: 500, before };
+function barParameters({ interval }, before = state.replay === null ? undefined : state.replay + 1, symbol = state.symbol) {
+  const deepHistory = ['15m', '30m'].includes(interval) || (indicatorToggles.reversal && topBottomPeriods.includes(interval));
+  return { symbol: symbol.id, interval, limit: deepHistory ? 1000 : 500, before };
 }
 function mergeBars(first, second) {
   return [...new Map([...first, ...second].map(bar => [bar.time, bar])).values()].sort((a, b) => a.time - b.time);
 }
-async function refreshCharts({ quiet = false } = {}) {
-  if (!state.symbol) return;
-  const revision = ++state.revision;
-  const chartPanes = visiblePanes().filter(supportsPane);
-  const jobs = new Map();
-  const getBars = interval => {
-    if (!jobs.has(interval)) jobs.set(interval, api('bars', barParameters({ interval })));
-    return jobs.get(interval);
+const aggregatedFeeds = { '2h': '1h', '8h': '4h' };
+function contextPlan(chartPanes) {
+  const requested = new Set(chartPanes.flatMap(pane => [...indicatorContexts(pane.interval, {
+    reversal: indicatorToggles.reversal, magnet: indicatorToggles.magnet,
+  })]));
+  const plan = new Map();
+  for (const period of requested) {
+    const source = supportedPeriods().includes(period) ? period : aggregatedFeeds[period];
+    if (supportedPeriods().includes(source)) plan.set(period, source);
+  }
+  return plan;
+}
+function rebuildContext() {
+  const available = visiblePanes().filter(supportsPane);
+  const raw = { ...state.contextSources };
+  for (const pane of available) {
+    if (pane.dataKey === candleKey(pane)) raw[pane.interval] = mergeBars(raw[pane.interval] || [], pane.bars);
+  }
+  const previous = state.contextBars || {};
+  const next = { ...raw };
+  for (const [period, source] of contextPlan(available)) {
+    if (period !== source && raw[source]?.length) next[period] = rollBars(raw[source], period);
+  }
+  state.contextBars = next;
+  return Object.keys(previous).length !== Object.keys(next).length ||
+    Object.entries(next).some(([interval, bars]) => !sameCandles(previous[interval], bars));
+}
+async function requestContexts(plan, load, signal) {
+  const intervals = [...new Set(plan.values())];
+  const read = async interval => {
+    try {
+      return [interval, (await load(interval)).bars];
+    } catch {
+      // An unavailable auxiliary period still leaves the main chart usable.
+      return [interval, []];
+    }
   };
-  if (!quiet) elements.notice.textContent = '正在载入 K 线…';
+  if (state.source !== 'ctrader-local' || !signal) return Promise.all(intervals.map(read));
+  // Give symbol clicks priority over auxiliary reads on the cBot's single execution thread.
+  const pairs = [];
+  for (const interval of intervals) {
+    signal.throwIfAborted();
+    pairs.push(await read(interval));
+  }
+  return pairs;
+}
+function rememberChartSnapshot() {
+  if (!liveSource() || !state.symbol) return;
+  const history = new Map();
+  for (const pane of panes) {
+    if (pane.dataKey !== candleKey(pane) || !pane.bars.length) continue;
+    const { limit } = barParameters(pane);
+    history.set(pane.interval, {
+      bars: pane.bars.slice(-limit), digits: pane.digits, hasMore: pane.hasMore || pane.bars.length > limit,
+    });
+  }
+  if (!history.size) return;
+  const contexts = Object.fromEntries(Object.entries(state.contextSources).map(([interval, bars]) =>
+    [interval, bars.slice(-1000)]));
+  state.chartCache.delete(state.symbol.id);
+  state.chartCache.set(state.symbol.id, { history, contexts, savedAt: Date.now() });
+  while (state.chartCache.size > 12) state.chartCache.delete(state.chartCache.keys().next().value);
+}
+
+function showChartSnapshot(item, byInterval, primary, { keepHistory, contexts = {} } = {}) {
+  const switching = state.pendingSymbol === item;
+  if (switching) {
+    rememberChartSnapshot();
+    stopMarketStream();
+    selectInstrument(item);
+    state.pendingSymbol = null;
+    clearCrosshair();
+    state.contextSources = contexts;
+    state.contextBars = {};
+    setDrawingTool('cursor');
+  }
+  const changed = [];
+  for (const pane of panes) {
+    if (pane.root.hidden && !switching) continue;
+    const key = candleKey(pane);
+    const result = byInterval.get(pane.interval);
+    if (!result) {
+      if ((!supportsPane(pane) || switching) && pane.bars.length) {
+        pane.dataKey = null;
+        applyBars(pane, { bars: [], digits: 5, hasMore: false });
+        changed.push(pane);
+      }
+      continue;
+    }
+    const data = { ...result };
+    const reset = pane.dataKey !== key || !pane.bars.length;
+    if (keepHistory && !reset) {
+      if (pane.bars[0].time < (data.bars[0]?.time ?? Infinity)) data.hasMore = pane.hasMore;
+      data.bars = mergeBars(pane.bars, data.bars);
+    }
+    const pushed = state.liveBars.get(pane.interval);
+    if (pushed?.length) data.bars = mergeBars(data.bars, pushed);
+    pane.dataKey = key;
+    if (applyBars(pane, data, { reset })) changed.push(pane);
+  }
+  const quotePeriod = byInterval.get(primary)?.bars.length ? primary :
+    [...byInterval].find(([, result]) => result.bars.length)?.[0] ?? primary;
+  const quote = byInterval.get(quotePeriod);
+  const last = quote?.bars.at(-1);
+  const observedChanged = state.latestObserved !== last?.time;
+  state.latestObserved = last?.time;
+  const contextChanged = rebuildContext();
+  for (const pane of panes) {
+    if (changed.includes(pane) || ((contextChanged || (state.source === 'offline' && observedChanged)) &&
+      !pane.root.hidden && supportsPane(pane))) renderIndicators(pane);
+  }
+  renderInstrument(quote?.bars ?? [], quote?.digits);
+  elements.notice.textContent = state.replay !== null
+    ? `历史回放 · ${displayTime(state.replay)}`
+    : last ? `最后一根 ${periods[quotePeriod]} · ${displayTime(last.time)}` : '当前区间暂无 K 线';
+  displayError();
+  updateMarketStream();
+}
+
+async function refreshCharts({ quiet = false } = {}) {
+  const item = state.pendingSymbol ?? state.symbol;
+  if (!item) return;
+  const revision = ++state.revision;
+  state.refreshController?.abort();
+  const controller = new AbortController();
+  state.refreshController = controller;
+  const chartPanes = visiblePanes().filter(supportsPane);
+  const primary = state.source === 'offline' || chartPanes.some(pane => pane.interval === '1h') ? '1h' : activePane().interval;
+  const intervals = [...new Set([...chartPanes.map(pane => pane.interval), primary])];
+  const source = state.source;
+  const getBars = interval => api('bars', barParameters({ interval }, undefined, item), source, controller.signal);
+  const switching = state.pendingSymbol === item;
+  const firstLiveLoad = switching && !state.symbol && liveSource();
+  const cached = switching && state.chartCache.get(item.id);
+  const useCache = cached && Date.now() - cached.savedAt < 5 * 60_000 &&
+    intervals.every(interval => cached.history.has(interval));
+  if (switching && state.symbol && !useCache) elements.notice.textContent = `正在切换至 ${item.name}…`;
+  else if (!quiet && !useCache) elements.notice.textContent = '正在载入 K 线…';
   state.busy = true;
   try {
-    const primary = state.source === 'offline' || chartPanes.some(pane => pane.interval === '1h') ? '1h' : activePane().interval;
-    const work = [...chartPanes.map(pane => getBars(pane.interval)), getBars(primary)];
-    const contextIntervals = new Set();
-    if (chartPanes.some(pane => pane.interval === '1h')) contextIntervals.add('4h');
-    if (chartPanes.some(pane => pane.interval === '1w')) contextIntervals.add('1mo');
-    const [results, pairs] = await Promise.all([
-      Promise.all(work),
-      Promise.all([...contextIntervals].map(async interval => [interval, (await getBars(interval)).bars])),
-    ]);
-    if (revision !== state.revision) return;
-    state.contextBars = {
-      ...Object.fromEntries(pairs), ...Object.fromEntries(chartPanes.map((pane, i) => [pane.interval, results[i].bars])),
-    };
-    for (const pane of visiblePanes()) {
-      if (supportsPane(pane)) continue;
-      applyBars(pane, { bars: [], digits: 5, hasMore: false });
-      renderIndicators(pane);
-    }
-    for (const [i, pane] of chartPanes.entries()) {
-      const data = { ...results[i] };
-      const key = candleKey(pane);
-      const reset = pane.dataKey !== key || !pane.bars.length;
-      const latestView = pane.chart.timeScale().scrollPosition() >= -5;
-      if (quiet && !reset && pane.bars.length) {
-        if (pane.bars[0].time < (data.bars[0]?.time ?? Infinity)) data.hasMore = pane.hasMore;
-        data.bars = mergeBars(pane.bars, data.bars);
+    if (useCache) showChartSnapshot(item, cached.history, primary, { contexts: cached.contexts });
+    const byInterval = new Map();
+    const failures = new Map();
+    await Promise.all(intervals.map(async interval => {
+      try {
+        byInterval.set(interval, await getBars(interval));
+      } catch (error) {
+        failures.set(interval, error);
+        return;
       }
-      const pushed = state.liveBars.get(pane.interval);
-      if (pushed?.length) data.bars = mergeBars(data.bars, pushed);
-      applyBars(pane, data, { reset });
-      renderIndicators(pane);
-      pane.dataKey = key;
-      if (!reset && latestView && data.bars.length) pane.chart.timeScale().scrollToRealTime();
+      if (firstLiveLoad && revision === state.revision && byInterval.get(interval).bars.length) {
+        showChartSnapshot(item, byInterval, primary);
+        const loading = intervals.filter(period => !byInterval.has(period) && !failures.has(period));
+        if (loading.length) elements.notice.textContent = `正在载入 ${loading.map(period => periods[period]).join('、')} K 线…`;
+      }
+    }));
+    if (revision !== state.revision) return;
+    if (!byInterval.size) throw failures.values().next().value;
+    showChartSnapshot(item, byInterval, primary, { keepHistory: quiet || useCache });
+    if (failures.size) {
+      const failed = intervals.filter(interval => failures.has(interval)).map(interval => periods[interval]);
+      elements.notice.textContent = `${failed.join('、')} K 线暂未载入 · ${failures.values().next().value.message}`;
     }
-    const quote = results.at(-1);
-    state.latestObserved = quote.bars.at(-1)?.time;
-    renderInstrument(quote.bars, quote.digits);
-    if (state.replay === null) {
-      const last = quote.bars.at(-1);
-      elements.notice.textContent = last ? `最后一根 ${periods[primary]} · ${displayTime(last.time)}` : '当前区间暂无 K 线';
-    } else {
-      elements.notice.textContent = `历史回放 · ${displayTime(state.replay)}`;
+    const plan = contextPlan(chartPanes);
+    for (const [period, from] of plan) if (byInterval.has(from)) plan.delete(period);
+    if (plan.size && switching && source === 'ctrader-local') {
+      await new Promise(resolve => setTimeout(resolve, 750));
+      if (revision !== state.revision) return;
     }
-    displayError();
-    updateMarketStream();
+    const pairs = await requestContexts(plan, getBars, controller.signal);
+    if (revision !== state.revision) return;
+    for (const [interval, bars] of pairs) {
+      state.contextSources[interval] = mergeBars(state.contextSources[interval] || [], bars);
+    }
+    if (rebuildContext()) for (const pane of chartPanes) renderIndicators(pane);
   } catch (error) {
-    if (revision === state.revision) {
-      elements.notice.textContent = quiet ? `刷新失败 · ${error.message}` : '';
-      if (!quiet) displayError(error.message);
+    if (revision !== state.revision) return;
+    const pending = state.pendingSymbol === item;
+    if (pending) state.pendingSymbol = null;
+    if (pending && state.symbol) elements.notice.textContent = `切换至 ${item.name} 失败 · ${error.message}`;
+    else if (quiet || useCache) elements.notice.textContent = `刷新失败 · ${error.message}`;
+    else {
+      elements.notice.textContent = '';
+      displayError(error.message);
     }
   } finally {
-    if (revision === state.revision) state.busy = false;
+    if (revision === state.revision) {
+      state.busy = false;
+      state.refreshController = undefined;
+    }
   }
 }
 async function pageHistory(pane) {
@@ -417,11 +682,23 @@ async function pageHistory(pane) {
   pane.paging = true;
   try {
     const oldLength = pane.bars.length;
-    const data = await api('bars', barParameters(pane, pane.bars[0].time));
+    const before = pane.bars[0].time;
+    const [data, context] = await Promise.all([
+      api('bars', barParameters(pane, before)),
+      requestContexts(contextPlan([pane]), interval => api('bars', barParameters({ interval }, before))),
+    ]);
     if (state.revision !== revision) return;
+    for (const [interval, bars] of context) {
+      state.contextSources[interval] = mergeBars(bars, state.contextSources[interval] || []);
+    }
     const range = pane.chart.timeScale().getVisibleLogicalRange();
     data.bars = mergeBars(data.bars, pane.bars);
     applyBars(pane, data);
+    if (rebuildContext()) {
+      for (const linked of visiblePanes().filter(supportsPane)) {
+        if (linked !== pane) renderIndicators(linked);
+      }
+    }
     renderIndicators(pane);
     const offset = data.bars.length - oldLength;
     if (range && offset) pane.chart.timeScale().setVisibleLogicalRange({ from: range.from + offset, to: range.to + offset });
@@ -442,19 +719,50 @@ function findBar(bars, time) {
   }
   return bars[high];
 }
-function syncCrosshair(pane, point) {
-  if (state.syncing) return;
-  state.syncing = true;
-  renderOHLC(pane, point.seriesData?.get(pane.series) || pane.bars.at(-1));
-  for (const linked of visiblePanes()) {
-    if (linked === pane) continue;
-    const closest = point.time && point.time <= (state.replay ?? linked.bars.at(-1)?.time + 32 * 86400) ?
-      findBar(linked.bars, point.time) : undefined;
-    if (closest) linked.chart.setCrosshairPosition(closest.close, closest.time, linked.series);
-    else linked.chart.clearCrosshairPosition();
-    renderOHLC(linked, closest || linked.bars.at(-1));
+function renderCrosshair(pane) {
+  const cursor = state.crosshair;
+  const time = cursor?.time;
+  const preview = pane.appliedPreview;
+  const bar = time === undefined || pane.root.hidden ? undefined :
+    preview?.time <= time ? preview : findBar(pane.bars, time);
+  const matching = bar && time < barEnd(bar.time, pane.interval) ? bar : undefined;
+
+  if (cursor?.pane === pane) {
+    pane.linkedCrosshair = undefined;
+    renderOHLC(pane, matching);
+    return;
   }
-  state.syncing = false;
+  const scale = pane.chart.timeScale();
+  const x = matching ? scale.timeToCoordinate(matching.time) : null;
+  const visible = x !== null && x >= 0 && x < scale.width() ? matching : undefined;
+  const key = visible ? `${visible.time}:${visible.close}:${x}` : undefined;
+  if (key !== pane.linkedCrosshair) {
+    pane.linkedCrosshair = key;
+    if (visible) pane.chart.setCrosshairPosition(visible.close, visible.time, pane.series);
+    else pane.chart.clearCrosshairPosition();
+  }
+  renderOHLC(pane, visible);
+}
+
+function clearCrosshair(keepNative) {
+  if (!state.crosshair) return;
+  const { pane } = state.crosshair;
+  state.crosshair = null;
+  if (keepNative) keepNative.linkedCrosshair = undefined;
+  if (pane !== keepNative) pane.chart.clearCrosshairPosition();
+  for (const linked of panes) renderCrosshair(linked);
+}
+
+function syncCrosshair(pane, point) {
+  // Chart redraws also emit crosshair moves, including those caused by linked panes.
+  if (!point.sourceEvent) return;
+  if (!point.point || !Number.isFinite(point.time) || !point.seriesData?.has(pane.series)) {
+    clearCrosshair(pane);
+    return;
+  }
+  if (state.crosshair?.pane !== pane) clearCrosshair(pane);
+  state.crosshair = { pane, time: point.time };
+  for (const linked of visiblePanes()) renderCrosshair(linked);
 }
 
 function matchingDrawings(pane) {
@@ -533,18 +841,21 @@ function renderWatchlist() {
   $('symbol-count').textContent = state.catalog.length ? String(state.catalog.length) : '';
   $('watch-quote-label').textContent = state.replay !== null ? '历史回放' :
     state.source === 'offline' ? '收盘 / H1 涨跌' : '券商品种';
-  const query = elements.search.value.trim().toLowerCase();
+  const clean = value => value.toLowerCase().replace(/[\s/]+/g, '');
+  const query = clean(elements.search.value);
   const groups = new Map();
   for (const item of state.catalog) {
     if (state.favoritesOnly && !favorites.has(favoriteKey(item))) continue;
-    if (query && !`${item.name} ${item.description || ''}`.toLowerCase().includes(query)) continue;
-    const category = categoryNames[item.category] || item.category || '券商品种';
+    if (query && !clean(item.name).includes(query) && !clean(item.description || '').includes(query)) continue;
+    const category = categoryOrder.includes(item.category) ? item.category : 'BROKER';
     if (!groups.has(category)) groups.set(category, []);
     groups.get(category).push(item);
   }
   const fragment = document.createDocumentFragment();
-  for (const [category, items] of groups) {
-    fragment.append(element('div', 'watch-group', category));
+  for (const category of categoryOrder) {
+    const items = groups.get(category);
+    if (!items?.length) continue;
+    fragment.append(element('div', 'watch-group', categoryNames[category] || '其他券商品种'));
     for (const item of items) {
       const selected = state.symbol?.id === item.id;
       const row = element('div', `symbol-row${selected ? ' selected' : ''}`);
@@ -588,65 +899,129 @@ function renderWatchlist() {
 function stopMarketStream() {
   state.liveStream?.close();
   state.liveStream = null;
+  clearTimeout(state.streamRecovery);
+  state.streamRecovery = undefined;
   state.streamKey = null;
   state.liveBars.clear();
+  state.previews.clear();
   $('live-bid').textContent = '—';
   $('live-ask').textContent = '—';
+  $('live-time').textContent = '';
   $('live-quote').hidden = true;
   $('live-quote').removeAttribute('title');
 }
+function displayPreview(pane) {
+  const preview = state.previews.get(pane.interval);
+  if (!preview || preview.bar.time <= (pane.bars.at(-1)?.time || 0)) return;
+  if (pane.digits !== preview.digits) {
+    pane.digits = preview.digits;
+    pane.series.applyOptions({ priceFormat: { type: 'price', precision: pane.digits, minMove: 10 ** -pane.digits } });
+  }
+  if (!sameCandle(pane.appliedPreview, preview.bar)) {
+    const newCandle = pane.appliedPreview?.time !== preview.bar.time;
+    pane.series.update(preview.bar);
+    pane.appliedPreview = preview.bar;
+    if (newCandle) pane.latestView.align();
+    if (pane.topBottom && topBottomPeriods.includes(pane.interval)) {
+      pane.topBottomView.showWindows(pane.topBottom, preview.bar);
+    }
+  }
+  return preview.bar;
+}
 function updateMarketStream() {
-  if (state.source !== 'ctrader' || !state.symbol || document.hidden) return;
+  if (!liveSource() || !state.symbol || document.hidden) return;
   const intervals = [...new Set(visiblePanes().filter(supportsPane).map(pane => pane.interval))].sort();
-  const key = `${state.symbol.id}:${intervals.join(',')}`;
+  const key = `${state.source}:${state.symbol.id}:${intervals.join(',')}`;
   if (state.streamKey === key) return;
   stopMarketStream();
   state.streamKey = key;
-  const parameters = new URLSearchParams({ source: 'ctrader', symbol: state.symbol.id });
+  const parameters = new URLSearchParams({ source: state.source, symbol: state.symbol.id });
   for (const interval of intervals) parameters.append('interval', interval);
   const stream = new EventSource(`/api/stream?${parameters}`);
   state.liveStream = stream;
+  let disconnected = false;
+  let lastRecovery = -Infinity;
+  const recover = () => {
+    if (state.liveStream !== stream || disconnected) return;
+    if (state.busy) {
+      state.streamRecovery = setTimeout(recover, 500);
+      return;
+    }
+    lastRecovery = performance.now();
+    refreshCharts({ quiet: true });
+  };
   stream.addEventListener('status', event => {
     if (state.liveStream !== stream) return;
     const status = JSON.parse(event.data);
     elements.connection.textContent = status.message ||
       (status.connected ? 'cTrader · 已订阅行情' : 'cTrader · 实时连接暂不可用');
-    if (!status.connected) $('live-quote').hidden = true;
+    if (!status.connected) {
+      disconnected = true;
+      clearTimeout(state.streamRecovery);
+    } else if (disconnected) {
+      disconnected = false;
+      state.streamRecovery = setTimeout(recover, Math.max(500, lastRecovery + 5000 - performance.now()));
+    }
+  });
+  stream.addEventListener('open', () => {
+    if (state.liveStream !== stream || state.source === 'ctrader-local' || !disconnected) return;
+    disconnected = false;
+    state.streamRecovery = setTimeout(recover, 500);
   });
   stream.addEventListener('quote', event => {
     if (state.liveStream !== stream) return;
     const quote = JSON.parse(event.data);
     const digits = state.symbol.digits ?? activePane().digits;
-    if (Number.isFinite(quote.bid)) $('live-bid').textContent = price(quote.bid, digits);
-    if (Number.isFinite(quote.ask)) $('live-ask').textContent = price(quote.ask, digits);
-    if (Number.isFinite(quote.time)) $('live-quote').title = `最近报价 ${displayTime(quote.time)} UTC+8`;
-    $('live-quote').hidden = false;
+    if (Number.isFinite(quote.bid)) writeText($('live-bid'), price(quote.bid, digits));
+    if (Number.isFinite(quote.ask)) writeText($('live-ask'), price(quote.ask, digits));
+    if (Number.isFinite(quote.time)) {
+      const time = quoteTime.format(new Date(quote.time * 1000));
+      if ($('live-time').textContent !== time) {
+        $('live-time').textContent = time;
+        $('live-quote').title = `最近报价 ${time} UTC+8`;
+      }
+    }
+    if ($('live-quote').hidden) $('live-quote').hidden = false;
+  });
+  stream.addEventListener('preview', event => {
+    if (state.liveStream !== stream) return;
+    const { interval, bar, digits } = JSON.parse(event.data);
+    const previous = state.previews.get(interval);
+    if (!intervals.includes(interval) || !Number.isFinite(bar?.time) ||
+      (previous && (bar.time < previous.bar.time || (digits === previous.digits && sameCandle(previous.bar, bar))))) return;
+    state.previews.set(interval, { bar, digits });
+    for (const pane of visiblePanes()) {
+      if (pane.interval !== interval || pane.dataKey !== candleKey(pane)) continue;
+      if (displayPreview(pane)) renderCrosshair(pane);
+    }
   });
   stream.addEventListener('bar', event => {
     if (state.liveStream !== stream) return;
     const { interval, bar, digits } = JSON.parse(event.data);
     if (!intervals.includes(interval) || !Number.isFinite(bar?.time)) return;
-    state.liveBars.set(interval, mergeBars(state.liveBars.get(interval) || [], [bar]).slice(-10));
+    const latest = state.liveBars.get(interval) || [];
+    if (latest.some(current => sameCandle(current, bar))) return;
+    state.liveBars.set(interval, mergeBars(latest, [bar]).slice(-10));
     for (const pane of visiblePanes()) {
-      if (pane.interval !== interval || pane.dataKey !== candleKey(pane) || !pane.bars.length) continue;
+      if (pane.interval !== interval || pane.dataKey !== candleKey(pane)) continue;
       const current = pane.bars.at(-1);
       if (current && current.time > bar.time) continue;
-      const latestView = pane.chart.timeScale().scrollPosition() >= -5;
       const bars = mergeBars(pane.bars, [bar]);
-      state.contextBars[interval] = bars;
       applyBars(pane, { bars, digits, hasMore: pane.hasMore });
-      renderIndicators(pane);
-      if (latestView) pane.chart.timeScale().scrollToRealTime();
       if (interval === '1h' || (!intervals.includes('1h') && pane === activePane())) {
         renderInstrument(bars, digits);
-        elements.notice.textContent = `最后一根 ${periods[interval]} · ${displayTime(bar.time)}`;
+        if (!state.pendingSymbol) elements.notice.textContent = `最后一根 ${periods[interval]} · ${displayTime(bar.time)}`;
       }
     }
+    rebuildContext();
+    for (const pane of visiblePanes().filter(supportsPane)) renderIndicators(pane);
+    if (interval === '1h') syncSelectedHistory();
   });
   stream.addEventListener('error', () => {
     if (state.liveStream !== stream) return;
-    $('live-quote').hidden = true;
-    elements.connection.textContent = 'cTrader · 实时重连中，历史 K 线仍会刷新';
+    disconnected = true;
+    clearTimeout(state.streamRecovery);
+    elements.connection.textContent = 'cTrader · 实时重连中';
   });
 }
 
@@ -658,15 +1033,19 @@ function setFavoritesOnly(only) {
 }
 function selectInstrument(item) {
   state.symbol = item;
+  alertView.refreshSelection();
   $('active-symbol').textContent = item?.name || '—';
   $('instrument-name').textContent = item?.name || '请选择品种';
   if (!item) $('instrument-meta').textContent = '';
   else $('instrument-meta').textContent = [item.description, categoryNames[item.category]]
-    .filter(Boolean).join(' · ') || (state.source === 'ctrader' ? 'cTrader' : '本地历史库');
+    .filter(Boolean).join(' · ') || (liveSource() ? 'cTrader' : '本地历史库');
   $('replay-toggle').disabled = state.source !== 'offline' || !item;
+  $('archive-strip').hidden = state.source !== 'ctrader-local' || !item?.localHistory;
+  writeText($('archive-note'), '');
   renderWatchlist();
 }
 async function chooseSymbol(item) {
+  if (state.pendingSymbol === item || (!state.pendingSymbol && state.symbol === item)) return;
   const preserveReplay = state.replay !== null;
   const time = state.replay;
   stopPlaying();
@@ -674,19 +1053,25 @@ async function chooseSymbol(item) {
     await moveReplay('start', { time, symbol: item.id, reset: true });
     return;
   }
-  stopMarketStream();
-  selectInstrument(item);
-  setDrawingTool('cursor');
-  clearChartData();
+  clearTimeout(state.archiveTimer);
+  state.pendingSymbol = item;
   await refreshCharts();
+  if (!state.busy && state.symbol === item && item.localHistory && state.source === 'ctrader-local') {
+    state.archiveTimer = setTimeout(() => {
+      if (state.symbol === item && !state.pendingSymbol) syncSelectedHistory();
+    }, 1500);
+  }
 }
-async function changeSource(source) {
+async function changeSource(source, { startup = false, symbol } = {}) {
+  const previousId = state.source === source ? state.symbol?.id : undefined;
   const revision = ++state.sourceRevision;
   stopPlaying();
+  clearTimeout(state.archiveTimer);
   stopMarketStream();
   state.source = source;
   state.replay = null;
   state.catalog = [];
+  state.chartCache.clear();
   state.sourceInfo = {};
   elements.source.value = source;
   elements.search.value = '';
@@ -710,18 +1095,67 @@ async function changeSource(source) {
     const items = await api('symbols');
     if (revision !== state.sourceRevision) return;
     state.catalog = items;
-    const item = items.find(item => item.name === 'EURUSD') || items[0];
+    renderWatchlist();
+    const item = items.find(item => item.id === symbol) || items.find(item => item.id === previousId) ||
+      items.find(item => item.id === info.preferredSymbol) || items.find(item => item.name === 'EURUSD') || items[0];
     if (!item) throw new Error('这个账户没有返回可用的品种。');
-    elements.connection.textContent = source === 'offline' ? '本地历史库 · 只读' : 'cTrader Open API · 正在连接实时行情';
+    const label = elements.source.selectedOptions[0].textContent;
+    elements.connection.textContent = source === 'offline' ? '本地历史库 · 只读' : `${label} · 正在连接实时行情`;
     $('watch-note').textContent = source === 'offline'
-      ? `${info.symbols} 个品种 · ${info.bars.toLocaleString('zh-CN')} 根 H1`
-      : '品种列表由授权券商账户提供';
+      ? `${info.symbols} 个品种 · ${info.bars.toLocaleString('zh-CN')} 根 H1${info.addedBars ? ' · cTrader 续接 ' + info.addedBars : ''}`
+      : '搜索代码或中文名，点击品种切换四图';
     await chooseSymbol(item);
+    if (startup && !state.symbol && !state.pendingSymbol && !state.busy) {
+      throw new Error($('error-message').textContent || 'cTrader 暂未返回 K 线。');
+    }
   } catch (error) {
     if (revision !== state.sourceRevision) return;
+    if (startup && source === defaultSource) {
+      await changeSource('offline');
+      if (state.sourceRevision === revision + 1 && state.symbol) {
+        elements.connection.textContent = 'cTrader 本地暂不可用 · 正在查看本地历史';
+      }
+      return;
+    }
     displayError(error.message);
     elements.connection.textContent = '数据源未连接';
     elements.notice.textContent = '';
+  }
+}
+
+async function openAlertSymbol(symbol) {
+  if (state.source !== defaultSource) await changeSource(defaultSource, { symbol });
+  else {
+    const item = state.catalog.find(item => item.id === symbol);
+    if (item) await chooseSymbol(item);
+  }
+  return state.source === defaultSource && state.symbol?.id === symbol;
+}
+
+async function syncSelectedHistory() {
+  if (state.pendingSymbol || state.source !== 'ctrader-local' || !state.symbol?.localHistory) return;
+  const { id, name } = state.symbol;
+  const revision = state.sourceRevision;
+  if (state.archiveJob?.id === id && state.archiveJob.revision === revision) return;
+  const job = { id, revision };
+  state.archiveJob = job;
+  const current = () => state.archiveJob === job && state.sourceRevision === revision && state.symbol?.id === id;
+  try {
+    const query = new URLSearchParams({ symbol: name });
+    const response = await fetch(`/api/history/sync?${query}`, { method: 'POST' });
+    const info = await response.json();
+    if (!current()) return;
+    if (!response.ok) throw new Error(info.error || 'H1 续接暂不可用');
+    const notes = {
+      ready: info.count ? `H1 续接至 ${displayTime(info.latest)}` : '本地 H1 已到最新收盘',
+      gap: 'cTrader 历史未覆盖原库断点',
+      unaligned: '两源 H1 开盘时间不对齐',
+    };
+    writeText($('archive-note'), notes[info.state] || '');
+  } catch (error) {
+    if (current()) writeText($('archive-note'), error.message);
+  } finally {
+    if (state.archiveJob === job) state.archiveJob = null;
   }
 }
 
@@ -849,7 +1283,7 @@ $('sma-tool').addEventListener('click', () => {
   press($('sma-tool'), state.sma);
   for (const pane of panes) displayMovingAverage(pane);
 });
-$('fit-tool').addEventListener('click', () => activePane().chart.timeScale().fitContent());
+$('fit-tool').addEventListener('click', () => activePane().latestView.fit());
 for (const indicator of Object.keys(indicatorToggles)) {
   const button = $(`indicator-${indicator}`);
   if (!button) continue;
@@ -859,6 +1293,7 @@ for (const indicator of Object.keys(indicatorToggles)) {
     press(button, indicatorToggles[indicator]);
     saveStorage('yidao.indicators', indicatorToggles);
     for (const pane of visiblePanes()) renderIndicators(pane);
+    if (indicator !== 'pivots' && indicatorToggles[indicator]) refreshCharts({ quiet: true });
   });
 }
 $('replay-toggle').addEventListener('click', toggleReplay);
@@ -880,24 +1315,37 @@ $('paper-undo').addEventListener('click', () => {
 });
 $('paper-log').addEventListener('click', () => $('paper-dialog').showModal());
 document.addEventListener('keydown', event => {
-  if (event.key === 'Escape' && !$('paper-dialog').open) {
+  if (event.key === 'Escape' && !document.querySelector('dialog[open]')) {
     setDrawingTool('cursor');
     document.querySelector('.watchlist').classList.remove('open');
   }
-  if (event.key === '/' && !event.ctrlKey && !event.metaKey && !['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target.tagName)) {
+  if (event.key === '/' && !document.querySelector('dialog[open]') &&
+    !event.ctrlKey && !event.metaKey && !['INPUT', 'SELECT', 'TEXTAREA'].includes(event.target.tagName)) {
     event.preventDefault();
     focusSymbolSearch();
   }
 });
 setInterval(() => {
-  if (state.source === 'ctrader' && !state.busy && !document.hidden) refreshCharts({ quiet: true });
+  if (liveSource() && !state.busy && !document.hidden) refreshCharts({ quiet: true });
 }, 15000);
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden) stopMarketStream();
-  else if (state.source === 'ctrader') refreshCharts({ quiet: true });
+  if (document.hidden) {
+    clearCrosshair();
+    stopMarketStream();
+  }
+  else if (liveSource()) {
+    for (const pane of visiblePanes()) pane.latestView.align();
+    refreshCharts({ quiet: true });
+    syncSelectedHistory();
+  }
 });
+$('archive-sync').addEventListener('click', syncSelectedHistory);
+setInterval(() => {
+  if (!document.hidden && !state.busy) syncSelectedHistory();
+}, 60000);
 
 updateLayout();
 renderPeriods();
 renderPaperStats();
-changeSource('offline');
+const alertView = installAlerts(() => state.source === 'ctrader-local' ? state.symbol?.id : state.symbol?.name, openAlertSymbol);
+changeSource(defaultSource, { startup: true });

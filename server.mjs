@@ -3,18 +3,60 @@ import { readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { createOfflineProvider } from './lib/offline.mjs';
 import { createCTraderProvider } from './lib/ctrader.mjs';
+import { createLocalCTraderProvider } from './lib/ctrader-local.mjs';
+import { createHistorySync, createHistoryTail } from './lib/history-tail.mjs';
+import { createAlertService } from './lib/alerts.mjs';
+
+try {
+  process.loadEnvFile(new URL('./.env.local', import.meta.url));
+} catch (error) {
+  if (error.code !== 'ENOENT') throw error;
+}
 
 const staticFiles = new Map([
   ['/', ['index.html', 'text/html; charset=utf-8']],
   ['/app.mjs', ['app.mjs', 'text/javascript; charset=utf-8']],
+  ['/alerts-view.mjs', ['alerts-view.mjs', 'text/javascript; charset=utf-8']],
   ['/indicators.mjs', ['indicators.mjs', 'text/javascript; charset=utf-8']],
+  ['/top-bottom.mjs', ['top-bottom.mjs', 'text/javascript; charset=utf-8']],
+  ['/top-bottom-view.mjs', ['top-bottom-view.mjs', 'text/javascript; charset=utf-8']],
+  ['/indicator-time.mjs', ['indicator-time.mjs', 'text/javascript; charset=utf-8']],
+  ['/momentum.mjs', ['momentum.mjs', 'text/javascript; charset=utf-8']],
+  ['/magnet.mjs', ['magnet.mjs', 'text/javascript; charset=utf-8']],
   ['/styles.css', ['styles.css', 'text/css; charset=utf-8']],
   ['/charts.mjs', ['vendor/lightweight-charts.mjs', 'text/javascript; charset=utf-8']],
 ]);
-const offline = createOfflineProvider();
+const historyTail = createHistoryTail();
+const offline = createOfflineProvider(undefined, historyTail);
 const ctrader = createCTraderProvider();
-const providers = new Map([['offline', offline], ['ctrader', ctrader]]);
+const ctraderLocal = createLocalCTraderProvider();
+const alerts = createAlertService(ctraderLocal);
+const syncHistory = createHistorySync(offline, ctraderLocal, historyTail);
+const providers = new Map([['offline', offline], ['ctrader', ctrader], ['ctrader-local', ctraderLocal]]);
 const requestedPort = Number(process.env.KUNHOU_PORT || 17651);
+const appName = 'Yidao Trading Chart';
+const address = port => `http://127.0.0.1:${port}/`;
+
+function openBrowser(url) {
+  if (!process.argv.includes('--open') || process.platform !== 'win32') return;
+  const browser = spawn('rundll32.exe', ['url.dll,FileProtocolHandler', url], { stdio: 'ignore' });
+  browser.on('error', () => console.log('请将上方地址复制到浏览器。'));
+}
+
+async function existingYidao(url) {
+  try {
+    const response = await fetch(new URL('api/status', url), {
+      signal: AbortSignal.timeout(1800), redirect: 'error',
+    });
+    if (!response.ok) return false;
+    const status = await response.json();
+    return status.app === appName ||
+      (typeof status.offline?.connected === 'boolean' &&
+       Array.isArray(status.ctrader?.intervals) && Array.isArray(status.ctraderLocal?.intervals));
+  } catch {
+    return false;
+  }
+}
 
 function fail(status, message) {
   throw Object.assign(new Error(message), { status });
@@ -33,7 +75,7 @@ function integer(raw, low, high, label, fallback) {
   return value;
 }
 
-async function streamMarket(response, symbol, intervals) {
+async function streamMarket(response, provider, symbol, intervals) {
   response.writeHead(200, {
     'Content-Type': 'text/event-stream; charset=utf-8',
     'Cache-Control': 'no-cache, no-transform',
@@ -59,7 +101,7 @@ async function streamMarket(response, symbol, intervals) {
     cleanup?.();
   });
   try {
-    cleanup = await ctrader.subscribe({
+    cleanup = await provider.subscribe({
       symbol, intervals,
       onEvent(type, data) {
         if (type === 'quote') {
@@ -68,7 +110,7 @@ async function streamMarket(response, symbol, intervals) {
             ask: data.ask ?? pendingQuote?.ask ?? null,
             time: data.time,
           };
-        } else if (type === 'bar' || type === 'status') send(type, data);
+        } else if (type === 'bar' || type === 'preview' || type === 'status') send(type, data);
       },
     });
     if (response.destroyed) cleanup();
@@ -89,10 +131,23 @@ const server = createServer(async (request, response) => {
   const localHost = `127.0.0.1:${server.address().port}`;
   try {
     if (request.headers.host !== localHost) return json(response, { error: '请使用本机回环地址。' }, 403);
-    if (request.method !== 'GET') fail(405, '只接受读取请求。');
     if (request.headers['sec-fetch-site'] === 'cross-site') fail(403, '只接受本应用的请求。');
     if (!request.url?.startsWith('/') || request.url.startsWith('//')) fail(400, '请求路径无效。');
     const url = new URL(request.url, `http://${localHost}`);
+    if (request.method === 'POST' && url.pathname === '/api/alerts/watch') {
+      if (request.headers.origin && request.headers.origin !== `http://${localHost}`) fail(403, '只接受本应用的请求。');
+      const symbol = url.searchParams.get('symbol');
+      const enabled = url.searchParams.get('enabled');
+      if (!symbol || symbol.length > 120 || !['1', '0'].includes(enabled)) fail(400, '监测品种或状态无效。');
+      return json(response, alerts.setWatch(symbol, enabled === '1'));
+    }
+    if (request.method === 'POST' && url.pathname === '/api/history/sync') {
+      if (request.headers.origin && request.headers.origin !== `http://${localHost}`) fail(403, '只接受本应用的请求。');
+      const symbol = url.searchParams.get('symbol');
+      if (!symbol || symbol.length > 120) fail(400, '请选择品种。');
+      return json(response, await syncHistory(symbol));
+    }
+    if (request.method !== 'GET') fail(405, '请求方法不支持。');
     const file = staticFiles.get(url.pathname);
     if (file) {
       const [path, type] = file;
@@ -103,22 +158,42 @@ const server = createServer(async (request, response) => {
     }
     if (url.pathname === '/api/status') {
       return json(response, {
+        app: appName,
         offline: offline.status(),
         ctrader: { configured: ctrader.configured, intervals: ctrader.intervals },
+        ctraderLocal: ctraderLocal.status(),
       });
+    }
+    if (url.pathname === '/api/alerts/status') return json(response, alerts.status());
+    if (url.pathname === '/api/alerts/instruments') return json(response, alerts.instruments());
+    if (url.pathname === '/api/alerts/history') {
+      const limit = integer(url.searchParams.get('limit'), 1, 200, '警报数量', 80);
+      const symbol = url.searchParams.get('symbol') ?? undefined;
+      if (symbol !== undefined && (!symbol || symbol.length > 120)) fail(400, '监测品种无效。');
+      const beforeTime = integer(url.searchParams.get('beforeTime'), 1, 7258118400, '警报时间');
+      const beforeId = integer(url.searchParams.get('beforeId'), 1, Number.MAX_SAFE_INTEGER, '警报游标');
+      if ((beforeTime === undefined) !== (beforeId === undefined)) fail(400, '警报游标不完整。');
+      return json(response, alerts.history({ limit, symbol, beforeTime, beforeId }));
     }
     const provider = providers.get(url.searchParams.get('source') || 'offline');
     if (!provider) fail(400, '数据源无效。');
     if (url.pathname === '/api/source') return json(response, await provider.status());
-    if (url.pathname === '/api/symbols') return json(response, await provider.symbols());
+    if (url.pathname === '/api/symbols') {
+      const items = await provider.symbols();
+      if (provider === offline) return json(response, items);
+      return json(response, items.map(item => {
+        const original = offline.findByName(item.name);
+        return original ? { ...item, category: original.category, description: original.description, localHistory: true } : item;
+      }));
+    }
     if (url.pathname === '/api/stream') {
-      if (provider !== ctrader) fail(400, '当前数据源不提供实时推送。');
-      if (!ctrader.configured) fail(503, '请先在本地配置 cTrader Open API。');
+      if (typeof provider.subscribe !== 'function') fail(400, '当前数据源不提供实时推送。');
+      if (!provider.configured) fail(503, '请先在本地配置 cTrader Open API。');
       const symbol = url.searchParams.get('symbol');
       const intervals = [...new Set(url.searchParams.getAll('interval'))];
       if (!symbol || symbol.length > 120 || intervals.length > 4 ||
-        intervals.some(interval => !ctrader.intervals.includes(interval))) fail(400, '订阅品种或周期无效。');
-      await streamMarket(response, symbol, intervals);
+        intervals.some(interval => !provider.intervals.includes(interval))) fail(400, '订阅品种或周期无效。');
+      await streamMarket(response, provider, symbol, intervals);
       return;
     }
     if (url.pathname === '/api/replay') {
@@ -146,22 +221,29 @@ const server = createServer(async (request, response) => {
   }
 });
 
-server.on('error', error => {
+server.on('error', async error => {
+  const url = address(requestedPort);
+  if (error.code === 'EADDRINUSE' && await existingYidao(url)) {
+    console.log(`${appName} 已在运行  ${url}`);
+    openBrowser(url);
+    return;
+  }
   console.error(`无法启动看盘服务（${error.code || '启动错误'}）。`);
   process.exitCode = 1;
 });
+ctraderLocal.attach(server);
 server.listen(requestedPort, '127.0.0.1', () => {
-  const url = `http://127.0.0.1:${server.address().port}/`;
-  console.log(`Yidao Trading Chart  ${url}`);
+  const url = address(server.address().port);
+  console.log(`${appName}  ${url}`);
   console.log('关闭此窗口或按 Ctrl+C 停止。');
-  if (!process.argv.includes('--open')) return;
-  if (process.platform === 'win32') {
-    const browser = spawn('rundll32.exe', ['url.dll,FileProtocolHandler', url], { stdio: 'ignore' });
-    browser.on('error', () => console.log('请将上方地址复制到浏览器。'));
-  }
+  alerts.start();
+  openBrowser(url);
 });
 
 server.on('close', () => {
+  alerts.close();
   offline.close();
   ctrader.close?.();
+  ctraderLocal.close();
+  historyTail.close();
 });
